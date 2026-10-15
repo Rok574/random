@@ -1,0 +1,117 @@
+name: Dump iOS 26.x SpringBoard headers
+
+# Put this file at .github/workflows/dump-springboard-headers.yml in a PRIVATE repo,
+# then run it from the Actions tab (Run workflow).
+
+on:
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: 'iOS versions as a JSON array'
+        default: '["26.3","26.4","26.5","26.6"]'
+        required: true
+      targets:
+        description: 'Comma-separated framework/target names (exact names)'
+        default: 'SpringBoard,SpringBoardHome,SpringBoardFoundation,SpringBoardUI,SpringBoardUIServices,SpringBoardServices'
+        required: true
+
+jobs:
+  dump:
+    name: iOS ${{ matrix.version }}
+    # PrivateHeaderKit needs Apple Silicon + macOS 26 or later
+    runs-on: macos-26
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(inputs.versions) }}
+    env:
+      VER: ${{ matrix.version }}
+      TARGETS: ${{ inputs.targets }}
+
+    steps:
+      - name: Select newest installed Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$XC" ]; then sudo xcode-select -s "$XC/Contents/Developer"; fi
+          xcodebuild -version
+
+      - name: Install PrivateHeaderKit
+        run: |
+          brew install lynnswap/tap/privateheaderkit
+          privateheaderkit --tool-version
+
+      - name: Make sure the iOS ${{ matrix.version }} simulator runtime is installed
+        run: |
+          xcrun simctl list runtimes
+          if ! xcrun simctl list runtimes | grep -q "iOS ${VER}"; then
+            echo "Runtime not preinstalled, downloading (this is large and can take a while)..."
+            xcodebuild -downloadPlatform iOS -buildVersion "${VER}"
+          fi
+          xcrun simctl list runtimes
+
+      - name: Generate headers
+        run: |
+          BUILD=$(xcrun simctl list runtimes -j | jq -r --arg v "$VER" \
+            '[.runtimes[] | select(.platform=="iOS" and (.version|startswith($v)))][0].buildversion // empty')
+          echo "Runtime build: ${BUILD:-unknown}"
+          EXTRA=()
+          if [ -n "$BUILD" ]; then EXTRA+=(--build "$BUILD"); fi
+          privateheaderkit \
+            --platform iOS \
+            --version "$VER" \
+            "${EXTRA[@]}" \
+            --out "$PWD/out" \
+            --target "$TARGETS"
+
+      - name: Build DockPad hook report
+        run: |
+          HDR=$(find out/generated-headers/iOS -maxdepth 1 -mindepth 1 -type d | head -1)
+          echo "Header dir: $HDR"
+          REPORT=out/DOCKPAD_REPORT_iOS_${VER}.md
+          {
+            echo "# DockPad hook check for iOS ${VER}"
+            echo
+            echo "Header directory: \`$HDR\`"
+            echo
+            echo "## Classes DockPad 1.1 hooks (iOS 15)"
+            for c in SBFloatingDockPlatterView SBFloatingDockController SBFloatingDockBehaviorAssertion \
+                     SBFloatingDockSuggestionsModel SBDeckSwitcherModifier; do
+              F=$(find "$HDR" -name "${c}.h" | head -1)
+              if [ -n "$F" ]; then echo "- FOUND   $c  ($F)"; else echo "- MISSING $c"; fi
+            done
+            echo
+            echo "## Selectors DockPad hooks"
+            for s in isFloatingDockSupported didMoveToWindow gesturePossible "_setRecentsEnabled:" \
+                     shouldConfigureInAppDockHiddenAssertion _numberOfRecentApps; do
+              N=$(grep -rlF -- "$s" "$HDR" --include='*.h' 2>/dev/null | wc -l | tr -d ' ')
+              echo "- \`$s\`: found in $N header(s)"
+              grep -rlF -- "$s" "$HDR" --include='*.h' 2>/dev/null | head -8 | sed 's/^/    - /'
+            done
+            echo
+            echo "## Everything dock/floating-dock related (file names)"
+            find "$HDR" -iname '*FloatingDock*' -o -iname '*DockIconList*' -o -iname '*DockView*' \
+              -o -iname '*DockController*' | sort | sed 's/^/- /'
+          } > "$REPORT"
+          cat "$REPORT"
+
+          # Copy the dock-related headers into one small, easy-to-read folder
+          mkdir -p "out/dock_headers_${VER}"
+          find "$HDR" \( -iname '*FloatingDock*' -o -iname '*DockIconList*' -o -iname '*DockView*' \
+            -o -iname '*DockController*' -o -name 'SBDeckSwitcherModifier*' \) -name '*.h' \
+            -exec cp {} "out/dock_headers_${VER}/" \;
+
+      - name: Zip results
+        run: |
+          mkdir -p dist
+          (cd out/generated-headers/iOS && zip -qr "../../../dist/SpringBoard-headers-iOS-${VER}.zip" .)
+          cp "out/DOCKPAD_REPORT_iOS_${VER}.md" dist/
+          (cd out && zip -qr "../dist/dock-headers-only-iOS-${VER}.zip" "dock_headers_${VER}")
+          ls -lh dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iOS-${{ matrix.version }}-springboard-headers
+          path: dist/
+          retention-days: 30
