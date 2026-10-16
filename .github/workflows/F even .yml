@@ -1,0 +1,69 @@
+name: Build ROMWall deb from a link
+
+# Only this one file is needed in the repo: .github/workflows/build-from-link.yml
+# 1) Upload ROMWall-source.zip to catbox.moe (or any direct-download host) and copy the link
+# 2) Actions tab -> "Build ROMWall deb from a link" -> Run workflow -> paste the link
+# 3) Get the .deb from the run's artifact, or from the catbox link printed at the end of the log
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "Direct link to ROMWall-source.zip (e.g. https://files.catbox.moe/abc123.zip)"
+        required: true
+        type: string
+      upload_deb:
+        description: "Also upload the finished .deb to catbox.moe and print the link"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Download the source zip
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: |
+          curl -fL --retry 3 -o src.zip "$ZIP_URL"
+          mkdir src && unzip -q src.zip -d src
+          MK=$(grep -rl "TWEAK_NAME = ROMWall" --include=Makefile src | head -1)
+          [ -n "$MK" ] || { echo "No ROMWall Makefile found in the zip"; exit 1; }
+          echo "PROJECT_DIR=$(cd "$(dirname "$MK")" && pwd)" >> "$GITHUB_ENV"
+
+      - name: Tools
+        run: brew install ldid make dpkg xz
+
+      - name: Theos (roothide fork)
+        run: |
+          git clone --recursive --depth 1 https://github.com/roothide/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: iOS SDK
+        run: |
+          git clone --depth 1 https://github.com/theos/sdks.git /tmp/sdks
+          cp -R /tmp/sdks/iPhoneOS16.5.sdk "$HOME/theos/sdks/"
+
+      - name: Build
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gmake package FINALPACKAGE=1
+
+      - name: Collect deb
+        run: |
+          mkdir out
+          cp "$PROJECT_DIR"/packages/*.deb out/
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ROMWall-deb
+          path: out/*.deb
+
+      - name: Upload deb to catbox (optional)
+        if: ${{ inputs.upload_deb }}
+        continue-on-error: true
+        run: |
+          for f in out/*.deb; do
+            echo "DEB LINK: $(curl -fsS -F reqtype=fileupload -F "fileToUpload=@$f" https://catbox.moe/user/api.php)"
+          done
