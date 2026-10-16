@@ -79,11 +79,20 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install idb (touch input) and cloudflared (tunnel)
+      # Required: this is what makes the web link work. No continue-on-error,
+      # so a failure here stops the run immediately instead of 3 minutes later.
+      - name: Install cloudflared (tunnel)
+        run: |
+          brew install cloudflared
+          cloudflared --version
+
+      # Optional: touch/button input. If this fails you still get a view-only simulator.
+      - name: Install idb (touch input)
         continue-on-error: true
         run: |
           brew tap facebook/fb
-          brew install idb-companion cloudflared
+          brew trust facebook/fb
+          brew install idb-companion
           pip install fb-idb
           idb --help | head -3
 
@@ -390,13 +399,19 @@ jobs:
           export TOKEN=$(openssl rand -hex 12)
           export PORT=8080
 
-          # idb companion for touch / button input
-          nohup idb_companion --udid "$UDID" --grpc-port 10882 > companion.log 2>&1 &
-          sleep 6
-          idb connect localhost 10882 || true
-          echo "--- idb self-test (failures here mean touch input won't work, view-only still will) ---"
-          idb ui tap 100 100 --udid "$UDID" || echo "idb tap FAILED"
-          idb ui button HOME --udid "$UDID" || echo "idb button FAILED"
+          command -v cloudflared >/dev/null || { echo "cloudflared missing, cannot create the web link"; exit 1; }
+
+          # idb companion for touch / button input (optional)
+          if command -v idb_companion >/dev/null && command -v idb >/dev/null; then
+            nohup idb_companion --udid "$UDID" --grpc-port 10882 > companion.log 2>&1 &
+            sleep 6
+            idb connect localhost 10882 || true
+            echo "--- idb self-test (failures here mean touch input won't work, view-only still will) ---"
+            idb ui tap 100 100 --udid "$UDID" || echo "idb tap FAILED"
+            idb ui button HOME --udid "$UDID" || echo "idb button FAILED"
+          else
+            echo "idb / idb_companion missing: view-only session (no touch input)"
+          fi
 
           nohup python3 server.py > server.log 2>&1 &
           SERVER_PID=$!
