@@ -3,6 +3,9 @@ name: Remote iOS 26.5 Simulator
 # Save as .github/workflows/remote-ios-simulator.yml, then run it from the Actions tab.
 # When the last step prints the link (also in the run's Summary page), open it in any browser.
 #
+# Video: idb MJPEG stream -> WebSocket (wss through the Cloudflare tunnel) -> canvas.
+# Falls back to a screenshot loop only if the idb stream cannot start.
+#
 # Controls: click/tap = touch, drag = swipe, hold = long press.
 # Side panel: Home, Lock, App Switcher, Siri, dark/light, open URL, launch app, type text, screenshot, Stop.
 
@@ -21,6 +24,14 @@ on:
         description: 'How long to keep the session alive (max ~340)'
         default: '120'
         required: true
+      scale:
+        description: 'Video scale factor (0.3 - 1.0). Lower = faster, blurrier.'
+        default: '0.5'
+        required: true
+      quality:
+        description: 'JPEG quality (0.2 - 1.0). Lower = faster, blockier.'
+        default: '0.6'
+        required: true
 
 jobs:
   simulator:
@@ -31,6 +42,8 @@ jobs:
       VER: ${{ inputs.version }}
       DEVICE: ${{ inputs.device }}
       MINUTES: ${{ inputs.minutes }}
+      SCALE: ${{ inputs.scale }}
+      QUALITY: ${{ inputs.quality }}
 
     steps:
       - name: Select newest installed Xcode
@@ -70,7 +83,6 @@ jobs:
           fi
           UDID=$(xcrun simctl create "Remote-$VER" "$DT" "$RT_ID")
           echo "UDID=$UDID" >> "$GITHUB_ENV"
-          if [ "$FAMILY" = "iPad" ]; then echo "DENSITY=2" >> "$GITHUB_ENV"; else echo "DENSITY=3" >> "$GITHUB_ENV"; fi
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
           xcrun simctl list devices | grep "$UDID"
@@ -79,15 +91,15 @@ jobs:
         with:
           python-version: '3.11'
 
-      # Required: this is what makes the web link work. No continue-on-error,
-      # so a failure here stops the run immediately instead of 3 minutes later.
+      # Required: this is what makes the web link work.
       - name: Install cloudflared (tunnel)
         run: |
           brew install cloudflared
           cloudflared --version
 
-      # Optional: touch/button input. If this fails you still get a view-only simulator.
-      - name: Install idb (touch input)
+      # Needed for fast video (video-stream) and touch input.
+      # If this fails you get the slow screenshot fallback and no touch.
+      - name: Install idb (video + touch input)
         continue-on-error: true
         run: |
           brew tap facebook/fb
@@ -96,75 +108,41 @@ jobs:
           pip install fb-idb
           idb --help | head -3
 
+      # Required: WebSocket server.
+      - name: Install aiohttp
+        run: pip install aiohttp
+
       - name: Write the web server
         run: |
           cat > server.py <<'PYEOF'
           #!/usr/bin/env python3
-          import hmac, json, os, secrets, struct, subprocess, tempfile, threading, time, urllib.parse
-          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          import asyncio, hmac, json, os, shutil, subprocess, sys, tempfile, threading, time
+          from concurrent.futures import ThreadPoolExecutor
+          from aiohttp import web, WSMsgType
 
           UDID = os.environ["UDID"]
           TOKEN = os.environ["TOKEN"]
           PORT = int(os.environ.get("PORT", "8080"))
-          SCALE_H = int(os.environ.get("SCALE_H", "1100"))
-          DENSITY = float(os.environ.get("DENSITY", "3"))
           IDB = os.environ.get("IDB", "idb")
+          FPS = os.environ.get("FPS", "30")
+          SCALE = os.environ.get("SCALE", "0.5")
+          QUALITY = os.environ.get("QUALITY", "0.6")
+          SCALE_H = int(os.environ.get("SCALE_H", "1100"))  # only used by the screenshot fallback
 
-          FRAME = {"data": b"", "id": 0, "rw": 0, "rh": 0}
-          COND = threading.Condition()
-          STOP = threading.Event()
-          LOCK = threading.Lock()
+          FRAME = {"data": b"", "id": 0}
+          MODE = {"v": "starting"}
           POINTS = {"v": None}
-          SERVER = None
+          COND = asyncio.Condition()
+          STOP_EV = asyncio.Event()
+          POOL = ThreadPoolExecutor(max_workers=4)
+          LOCK = threading.Lock()
 
 
-          def jpeg_size(b):
-              i = 2
-              while i < len(b) - 9:
-                  if b[i] != 0xFF:
-                      i += 1
-                      continue
-                  m = b[i + 1]
-                  if m in (0xC0, 0xC1, 0xC2):
-                      h, w = struct.unpack(">HH", b[i + 5:i + 9])
-                      return w, h
-                  if m in (0xD8, 0x01) or 0xD0 <= m <= 0xD7:
-                      i += 2
-                      continue
-                  i += 2 + struct.unpack(">H", b[i + 2:i + 4])[0]
-              return 0, 0
+          def log(*a):
+              print(*a, flush=True)
 
 
-          def capture_loop():
-              tmp = tempfile.gettempdir()
-              raw = os.path.join(tmp, "sim_raw.jpg")
-              small = os.path.join(tmp, "sim_small.jpg")
-              while not STOP.is_set():
-                  t = time.time()
-                  r = subprocess.run(["xcrun", "simctl", "io", UDID, "screenshot", "--type=jpeg", raw],
-                                     capture_output=True)
-                  if r.returncode == 0:
-                      src = raw
-                      try:
-                          rw, rh = jpeg_size(open(raw, "rb").read(4096 * 16))
-                      except Exception:
-                          rw, rh = 0, 0
-                      if SCALE_H > 0:
-                          s = subprocess.run(["sips", "--resampleHeight", str(SCALE_H), "-s", "formatOptions", "60",
-                                              raw, "--out", small], capture_output=True)
-                          if s.returncode == 0:
-                              src = small
-                      try:
-                          data = open(src, "rb").read()
-                      except Exception:
-                          continue
-                      with COND:
-                          FRAME.update(data=data, id=FRAME["id"] + 1, rw=rw, rh=rh)
-                          COND.notify_all()
-                  dt = time.time() - t
-                  if dt < 0.08:
-                      time.sleep(0.08 - dt)
-
+          # ---------------------------------------------------------------- input (blocking, run in a thread)
 
           def run(cmd, timeout=40):
               try:
@@ -184,53 +162,229 @@ jobs:
           def points():
               if POINTS["v"]:
                   return POINTS["v"]
-              try:
-                  out = subprocess.run([IDB, "describe", "--udid", UDID, "--json"],
-                                       capture_output=True, text=True, timeout=25).stdout
-                  sd = json.loads(out)["screen_dimensions"]
-                  POINTS["v"] = (float(sd["width_points"]), float(sd["height_points"]))
-                  return POINTS["v"]
-              except Exception:
-                  return (FRAME["rw"] / DENSITY, FRAME["rh"] / DENSITY)
+              out = subprocess.run([IDB, "describe", "--udid", UDID, "--json"],
+                                   capture_output=True, text=True, timeout=25).stdout
+              sd = json.loads(out)["screen_dimensions"]
+              POINTS["v"] = (float(sd["width_points"]), float(sd["height_points"]))
+              return POINTS["v"]
 
 
-          def handle(path, b):
-              if path == "/tap":
-                  W, H = points()
-                  a = ["ui", "tap", str(round(b["x"] * W)), str(round(b["y"] * H))]
-                  if b.get("dur", 0) > 0:
-                      a += ["--duration", str(b["dur"])]
-                  return idb(a)
-              if path == "/swipe":
-                  W, H = points()
-                  a = ["ui", "swipe", str(round(b["x1"] * W)), str(round(b["y1"] * H)),
-                       str(round(b["x2"] * W)), str(round(b["y2"] * H)), "--duration", str(b.get("dur", 0.3))]
-                  return idb(a)
-              if path == "/button":
-                  name = b.get("name", "")
-                  if name not in ("HOME", "LOCK", "SIDE_BUTTON", "SIRI", "APPLE_PAY"):
-                      return {"ok": False, "msg": "bad button"}
-                  return idb(["ui", "button", name])
-              if path == "/text":
-                  return idb(["ui", "text", str(b.get("text", ""))])
-              if path == "/key":
-                  return idb(["ui", "key", str(int(b["code"]))])
-              if path == "/appearance":
-                  mode = b.get("mode")
-                  if mode not in ("light", "dark"):
-                      return {"ok": False, "msg": "bad mode"}
-                  return run(["xcrun", "simctl", "ui", UDID, "appearance", mode])
-              if path == "/openurl":
-                  return run(["xcrun", "simctl", "openurl", UDID, str(b.get("url", ""))])
-              if path == "/launch":
-                  return run(["xcrun", "simctl", "launch", UDID, str(b.get("bundle", ""))])
-              if path == "/stop":
-                  STOP.set()
-                  with COND:
-                      COND.notify_all()
-                  threading.Thread(target=SERVER.shutdown, daemon=True).start()
-                  return {"ok": True, "msg": "stopping session"}
+          def handle(b):
+              t = b.get("t")
+              with LOCK:
+                  if t == "tap":
+                      W, H = points()
+                      a = ["ui", "tap", str(round(b["x"] * W)), str(round(b["y"] * H))]
+                      if b.get("dur", 0) > 0:
+                          a += ["--duration", str(b["dur"])]
+                      return idb(a)
+                  if t == "swipe":
+                      W, H = points()
+                      a = ["ui", "swipe", str(round(b["x1"] * W)), str(round(b["y1"] * H)),
+                           str(round(b["x2"] * W)), str(round(b["y2"] * H)),
+                           "--duration", str(b.get("dur", 0.3))]
+                      return idb(a)
+                  if t == "button":
+                      name = b.get("name", "")
+                      if name not in ("HOME", "LOCK", "SIDE_BUTTON", "SIRI", "APPLE_PAY"):
+                          return {"ok": False, "msg": "bad button"}
+                      return idb(["ui", "button", name])
+                  if t == "text":
+                      return idb(["ui", "text", str(b.get("text", ""))])
+                  if t == "key":
+                      return idb(["ui", "key", str(int(b["code"]))])
+                  if t == "appearance":
+                      mode = b.get("mode")
+                      if mode not in ("light", "dark"):
+                          return {"ok": False, "msg": "bad mode"}
+                      return run(["xcrun", "simctl", "ui", UDID, "appearance", mode])
+                  if t == "openurl":
+                      return run(["xcrun", "simctl", "openurl", UDID, str(b.get("url", ""))])
+                  if t == "launch":
+                      return run(["xcrun", "simctl", "launch", UDID, str(b.get("bundle", ""))])
               return {"ok": False, "msg": "unknown action"}
+
+
+          # ---------------------------------------------------------------- video capture
+
+          async def publish(data):
+              async with COND:
+                  FRAME["data"] = data
+                  FRAME["id"] += 1
+                  COND.notify_all()
+
+
+          async def log_stderr(proc):
+              try:
+                  while True:
+                      line = await proc.stderr.readline()
+                      if not line:
+                          return
+                      log("[idb video-stream]", line.decode(errors="replace").rstrip())
+              except Exception:
+                  pass
+
+
+          async def stream_idb():
+              """Continuous MJPEG from the simulator framebuffer. Returns False if it never produced frames."""
+              cmd = [IDB, "video-stream", "--fps", FPS, "--format", "mjpeg",
+                     "--compression-quality", QUALITY, "--scale-factor", SCALE, "--udid", UDID]
+              log("starting:", " ".join(cmd))
+              proc = await asyncio.create_subprocess_exec(
+                  *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+              asyncio.create_task(log_stderr(proc))
+              buf = bytearray()
+              got = False
+              try:
+                  while not STOP_EV.is_set():
+                      try:
+                          chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=(5 if got else 20))
+                      except asyncio.TimeoutError:
+                          if not got:
+                              log("no video frames within 20s")
+                              return False
+                          continue  # static screen can legitimately send nothing
+                      if not chunk:
+                          log("idb video-stream ended")
+                          return False
+                      buf += chunk
+                      latest = None
+                      while True:
+                          soi = buf.find(b"\xff\xd8")
+                          if soi < 0:
+                              buf.clear()
+                              break
+                          eoi = buf.find(b"\xff\xd9", soi + 2)
+                          if eoi < 0:
+                              if soi > 0:
+                                  del buf[:soi]
+                              break
+                          latest = bytes(buf[soi:eoi + 2])
+                          del buf[:eoi + 2]
+                      if len(buf) > 20_000_000:
+                          buf.clear()
+                      if latest:
+                          if not got:
+                              got = True
+                              MODE["v"] = "idb mjpeg stream"
+                              log("first frame received; streaming via idb mjpeg")
+                          await publish(latest)  # only the newest frame in this chunk matters
+                  return True
+              finally:
+                  if proc.returncode is None:
+                      proc.kill()
+
+
+          async def stream_screenshots():
+              MODE["v"] = "screenshot fallback (slow)"
+              log("using screenshot fallback")
+              tmp = tempfile.gettempdir()
+              raw = os.path.join(tmp, "sim_raw.jpg")
+              small = os.path.join(tmp, "sim_small.jpg")
+              while not STOP_EV.is_set():
+                  t = time.time()
+                  p = await asyncio.create_subprocess_exec(
+                      "xcrun", "simctl", "io", UDID, "screenshot", "--type=jpeg", raw,
+                      stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                  if await p.wait() == 0:
+                      src = raw
+                      if SCALE_H > 0:
+                          s = await asyncio.create_subprocess_exec(
+                              "sips", "--resampleHeight", str(SCALE_H), "-s", "formatOptions", "60",
+                              raw, "--out", small,
+                              stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                          if await s.wait() == 0:
+                              src = small
+                      try:
+                          data = await asyncio.to_thread(lambda: open(src, "rb").read())
+                          await publish(data)
+                      except Exception:
+                          pass
+                  dt = time.time() - t
+                  if dt < 0.05:
+                      await asyncio.sleep(0.05 - dt)
+
+
+          async def capture():
+              if shutil.which(IDB):
+                  await stream_idb()
+                  if STOP_EV.is_set():
+                      return
+                  log("idb stream unavailable, falling back")
+              else:
+                  log("idb not installed, falling back")
+              await stream_screenshots()
+
+
+          # ---------------------------------------------------------------- web
+
+          def authed(request):
+              cands = [request.query.get("key", ""), request.cookies.get("k", "")]
+              return any(c and hmac.compare_digest(c.encode(), TOKEN.encode()) for c in cands)
+
+
+          async def index(request):
+              if not authed(request):
+                  return web.Response(status=403, text="forbidden")
+              resp = web.Response(text=PAGE, content_type="text/html", charset="utf-8")
+              resp.set_cookie("k", TOKEN, path="/", httponly=True, secure=True, samesite="Lax")
+              return resp
+
+
+          async def shot(request):
+              if not authed(request):
+                  return web.Response(status=403, text="forbidden")
+              p = os.path.join(tempfile.gettempdir(), "shot.png")
+              r = await asyncio.to_thread(
+                  subprocess.run, ["xcrun", "simctl", "io", UDID, "screenshot", p], capture_output=True)
+              if r.returncode != 0:
+                  return web.Response(status=500, text="screenshot failed")
+              data = await asyncio.to_thread(lambda: open(p, "rb").read())
+              return web.Response(body=data, content_type="image/png",
+                                  headers={"Content-Disposition": "attachment; filename=simulator.png"})
+
+
+          async def sender(ws):
+              last = 0
+              while not ws.closed:
+                  async with COND:
+                      await COND.wait_for(lambda: FRAME["id"] > last or STOP_EV.is_set())
+                      data, last = FRAME["data"], FRAME["id"]
+                  if STOP_EV.is_set():
+                      await ws.send_json({"t": "stopped"})
+                      return
+                  await ws.send_bytes(data)  # awaiting here = natural frame dropping for slow clients
+
+
+          async def ws_handler(request):
+              if not authed(request):
+                  return web.Response(status=403, text="forbidden")
+              ws = web.WebSocketResponse(heartbeat=20, max_msg_size=1 << 20)
+              await ws.prepare(request)
+              await ws.send_json({"t": "toast", "msg": "video: " + MODE["v"]})
+              task = asyncio.create_task(sender(ws))
+              loop = asyncio.get_running_loop()
+              try:
+                  async for msg in ws:
+                      if msg.type != WSMsgType.TEXT:
+                          continue
+                      try:
+                          b = json.loads(msg.data)
+                      except Exception:
+                          continue
+                      if b.get("t") == "stop":
+                          STOP_EV.set()
+                          async with COND:
+                              COND.notify_all()
+                          continue
+                      try:
+                          res = await loop.run_in_executor(POOL, handle, b)
+                      except Exception as e:
+                          res = {"ok": False, "msg": "error: %s" % e}
+                      await ws.send_json({"t": "toast", "msg": res.get("msg", "ok")})
+              finally:
+                  task.cancel()
+              return ws
 
 
           PAGE = r'''<!doctype html><html><head><meta charset="utf-8">
@@ -243,8 +397,8 @@ jobs:
                display:flex;align-items:center;justify-content:center;padding:12px}
           #wrap{display:flex;gap:18px;align-items:center;justify-content:center;flex-wrap:wrap}
           #bezel{background:#000;border-radius:46px;padding:12px;box-shadow:0 0 0 2px #333,0 12px 40px #000a}
-          #scr{touch-action:none;cursor:pointer;line-height:0;border-radius:34px;overflow:hidden;background:#111;min-width:200px;min-height:300px}
-          #img{max-height:86vh;max-width:min(80vw,520px);display:block;user-select:none;-webkit-user-drag:none}
+          #scr{touch-action:none;cursor:pointer;line-height:0;border-radius:34px;overflow:hidden;background:#111}
+          #cv{max-height:86vh;max-width:min(80vw,520px);width:auto;height:auto;display:block;user-select:none;-webkit-user-drag:none}
           #side{display:flex;flex-direction:column;gap:8px;width:190px}
           button{background:#1d212b;color:#e6e6e6;border:1px solid #2c3140;border-radius:10px;padding:10px 12px;font:inherit;cursor:pointer}
           button:active{background:#2a3040}
@@ -252,10 +406,11 @@ jobs:
           input{background:#161a22;color:#e6e6e6;border:1px solid #2c3140;border-radius:10px;padding:9px 10px;font:inherit;width:100%}
           .row{display:flex;gap:6px}.row>*{flex:1}
           #toast{min-height:18px;font-size:12px;color:#9aa4b8;word-break:break-word}
+          #fps{font-size:11px;color:#6d778c}
           h4{margin:6px 0 0;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#7f8aa3;font-weight:600}
           </style></head><body>
           <div id="wrap">
-            <div id="bezel"><div id="scr"><img id="img" alt="" draggable="false"></div></div>
+            <div id="bezel"><div id="scr"><canvas id="cv" width="390" height="844"></canvas></div></div>
             <div id="side">
               <h4>Hardware</h4>
               <button onclick="btn('HOME')">Home</button>
@@ -278,31 +433,56 @@ jobs:
               <button onclick="location.href='/shot.png'">Save screenshot</button>
               <button class="danger" onclick="if(confirm('Stop the session?'))post('/stop',{})">Stop session</button>
               <div id="toast"></div>
+              <div id="fps"></div>
             </div>
           </div>
           <script>
-          const img=document.getElementById('img'),scr=document.getElementById('scr'),tt=document.getElementById('toast');
-          const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+          const cv=document.getElementById('cv'),ctx=cv.getContext('2d'),scr=document.getElementById('scr');
+          const tt=document.getElementById('toast'),fpsEl=document.getElementById('fps');
           function val(i){return document.getElementById(i).value}
           function toast(m){tt.textContent=m}
-          async function post(p,b){try{const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});const j=await r.json();toast(j.msg||(j.ok?'ok':'error'))}catch(e){toast('request failed')}}
+          let ws=null,stopped=false;
+          function send(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));else toast('not connected')}
+          function post(p,b){send(Object.assign({t:p.slice(1)},b||{}))}
           function btn(n){post('/button',{name:n})}
           function gest(x1,y1,x2,y2,d){post('/swipe',{x1:x1,y1:y1,x2:x2,y2:y2,dur:d})}
           function sendText(){post('/text',{text:val('txt')});document.getElementById('txt').value=''}
-          let last=0;
-          async function loop(){
-            while(true){
+
+          let pending=null,busy=false,frames=0,lastT=performance.now();
+          async function drain(){
+            busy=true;
+            while(pending){
+              const b=pending;pending=null;
               try{
-                const r=await fetch('/frame?after='+last,{cache:'no-store'});
-                if(r.status===200){last=parseInt(r.headers.get('X-Frame-Id'));const b=await r.blob();const u=URL.createObjectURL(b);const old=img.src;img.src=u;if(old&&old.startsWith('blob:'))URL.revokeObjectURL(old)}
-                else if(r.status===410){toast('session stopped');return}
-                else await sleep(200);
-              }catch(e){await sleep(1000)}
+                const bm=await createImageBitmap(b);
+                if(cv.width!==bm.width||cv.height!==bm.height){cv.width=bm.width;cv.height=bm.height}
+                ctx.drawImage(bm,0,0);bm.close();
+                frames++;
+              }catch(e){}
             }
+            busy=false;
           }
-          loop();
+          setInterval(()=>{const n=performance.now();fpsEl.textContent=(frames*1000/(n-lastT)).toFixed(1)+' fps';frames=0;lastT=n},1000);
+
+          function connect(){
+            ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
+            ws.onopen=()=>toast('connected');
+            ws.onmessage=e=>{
+              if(typeof e.data==='string'){
+                const j=JSON.parse(e.data);
+                if(j.t==='toast')toast(j.msg);
+                else if(j.t==='stopped'){stopped=true;toast('session stopped')}
+                return;
+              }
+              pending=e.data;
+              if(!busy)drain();
+            };
+            ws.onclose=()=>{if(!stopped){toast('reconnecting...');setTimeout(connect,1000)}};
+          }
+          connect();
+
           let down=null;
-          function frac(x,y){const r=img.getBoundingClientRect();return[Math.min(1,Math.max(0,(x-r.left)/r.width)),Math.min(1,Math.max(0,(y-r.top)/r.height))]}
+          function frac(x,y){const r=cv.getBoundingClientRect();return[Math.min(1,Math.max(0,(x-r.left)/r.width)),Math.min(1,Math.max(0,(y-r.top)/r.height))]}
           scr.addEventListener('pointerdown',e=>{scr.setPointerCapture(e.pointerId);down={x:e.clientX,y:e.clientY,t:performance.now()};e.preventDefault()});
           scr.addEventListener('pointerup',e=>{
             if(!down)return;
@@ -315,82 +495,28 @@ jobs:
           </script></body></html>'''
 
 
-          class Handler(BaseHTTPRequestHandler):
-              protocol_version = "HTTP/1.1"
+          async def main():
+              app = web.Application()
+              app.add_routes([web.get("/", index), web.get("/ws", ws_handler), web.get("/shot.png", shot)])
+              runner = web.AppRunner(app, access_log=None)
+              await runner.setup()
+              await web.TCPSite(runner, "127.0.0.1", PORT).start()
+              asyncio.create_task(capture())
+              asyncio.get_running_loop().run_in_executor(POOL, lambda: _warm())
+              await STOP_EV.wait()
+              await asyncio.sleep(0.5)
+              await runner.cleanup()
 
-              def log_message(self, *a):
-                  pass
 
-              def _auth(self):
-                  qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                  cand = [qs.get("key", [""])[0]]
-                  for part in self.headers.get("Cookie", "").split(";"):
-                      k, _, v = part.strip().partition("=")
-                      if k == "k":
-                          cand.append(v)
-                  return any(c and hmac.compare_digest(c.encode(), TOKEN.encode()) for c in cand)
-
-              def _send(self, code, body, ctype, extra=None):
-                  self.send_response(code)
-                  self.send_header("Content-Type", ctype)
-                  self.send_header("Content-Length", str(len(body)))
-                  for k, v in (extra or {}).items():
-                      self.send_header(k, v)
-                  self.end_headers()
-                  self.wfile.write(body)
-
-              def do_GET(self):
-                  if not self._auth():
-                      return self._send(403, b"forbidden", "text/plain")
-                  u = urllib.parse.urlparse(self.path)
-                  qs = urllib.parse.parse_qs(u.query)
-                  if u.path == "/":
-                      cookie = "k=%s; Path=/; HttpOnly; Secure; SameSite=Lax" % TOKEN
-                      return self._send(200, PAGE.encode(), "text/html; charset=utf-8", {"Set-Cookie": cookie})
-                  if u.path == "/frame":
-                      after = int(qs.get("after", ["0"])[0] or 0)
-                      with COND:
-                          COND.wait_for(lambda: FRAME["id"] > after or STOP.is_set(), timeout=10)
-                          data, fid = FRAME["data"], FRAME["id"]
-                      if STOP.is_set():
-                          return self._send(410, b"stopped", "text/plain")
-                      if fid <= after or not data:
-                          return self._send(204, b"", "text/plain")
-                      return self._send(200, data, "image/jpeg", {"X-Frame-Id": str(fid), "Cache-Control": "no-store"})
-                  if u.path == "/shot.png":
-                      p = os.path.join(tempfile.gettempdir(), "shot.png")
-                      r = subprocess.run(["xcrun", "simctl", "io", UDID, "screenshot", p], capture_output=True)
-                      if r.returncode != 0:
-                          return self._send(500, b"screenshot failed", "text/plain")
-                      return self._send(200, open(p, "rb").read(), "image/png",
-                                        {"Content-Disposition": "attachment; filename=simulator.png"})
-                  self._send(404, b"not found", "text/plain")
-
-              def do_POST(self):
-                  if not self._auth():
-                      return self._send(403, b"forbidden", "text/plain")
-                  n = int(self.headers.get("Content-Length", "0") or 0)
-                  try:
-                      body = json.loads(self.rfile.read(n) or b"{}")
-                  except Exception:
-                      body = {}
-                  path = urllib.parse.urlparse(self.path).path
-                  try:
-                      with LOCK:
-                          res = handle(path, body)
-                  except Exception as e:
-                      res = {"ok": False, "msg": "error: %s" % e}
-                  self._send(200, json.dumps(res).encode(), "application/json")
+          def _warm():
+              try:
+                  points()
+              except Exception as e:
+                  log("could not read screen size yet:", e)
 
 
           if __name__ == "__main__":
-              threading.Thread(target=capture_loop, daemon=True).start()
-              ThreadingHTTPServer.daemon_threads = True
-              SERVER = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-              try:
-                  SERVER.serve_forever()
-              finally:
-                  STOP.set()
+              asyncio.run(main())
           PYEOF
           python3 -m py_compile server.py && echo "server.py OK"
 
@@ -398,27 +524,30 @@ jobs:
         run: |
           export TOKEN=$(openssl rand -hex 12)
           export PORT=8080
+          export FPS=30
 
           command -v cloudflared >/dev/null || { echo "cloudflared missing, cannot create the web link"; exit 1; }
 
-          # idb companion for touch / button input (optional)
+          # idb companion for video stream + touch / button input
           if command -v idb_companion >/dev/null && command -v idb >/dev/null; then
             nohup idb_companion --udid "$UDID" --grpc-port 10882 > companion.log 2>&1 &
             sleep 6
             idb connect localhost 10882 || true
-            echo "--- idb self-test (failures here mean touch input won't work, view-only still will) ---"
+            echo "--- idb self-test (failures here mean touch input won't work) ---"
             idb ui tap 100 100 --udid "$UDID" || echo "idb tap FAILED"
             idb ui button HOME --udid "$UDID" || echo "idb button FAILED"
           else
-            echo "idb / idb_companion missing: view-only session (no touch input)"
+            echo "idb / idb_companion missing: slow screenshot fallback, no touch input"
           fi
 
           nohup python3 server.py > server.log 2>&1 &
           SERVER_PID=$!
           sleep 4
           curl -fsS "http://127.0.0.1:$PORT/?key=$TOKEN" -o /dev/null || { cat server.log; exit 1; }
+          # stream the server log (shows whether idb mjpeg or the fallback is in use)
+          tail -n +1 -f server.log &
 
-          nohup cloudflared tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate > cf.log 2>&1 &
+          nohup cloudflared tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate --protocol http2 > cf.log 2>&1 &
           CF_PID=$!
           URL=""
           for i in $(seq 1 60); do
