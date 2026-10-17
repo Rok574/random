@@ -43,9 +43,15 @@ jobs:
 
       - name: Build .deb
         run: |
-          MK=$(find src -name Makefile -not -path '*/__MACOSX/*' | head -n1)
-          if [ -z "$MK" ]; then echo "No Makefile found in the zip"; exit 1; fi
-          cd "$(dirname "$MK")"
+          # Use the project root: the folder holding the top-level `control` file
+          # (not the prefs/ subproject, which has its own Makefile but no control).
+          CTRL=$(find src -name control -not -path '*/layout/*' -not -path '*/__MACOSX/*' \
+                 | awk '{ print length, $0 }' | sort -n | head -n1 | cut -d' ' -f2-)
+          if [ -z "$CTRL" ]; then echo "No control file found in the zip"; exit 1; fi
+          ROOT=$(dirname "$CTRL")
+          if [ ! -f "$ROOT/Makefile" ]; then echo "No Makefile next to control in $ROOT"; exit 1; fi
+          echo "Building in $ROOT"
+          cd "$ROOT"
           make package FINALPACKAGE=1
           mkdir -p "$GITHUB_WORKSPACE/out"
           cp packages/*.deb "$GITHUB_WORKSPACE/out/"
