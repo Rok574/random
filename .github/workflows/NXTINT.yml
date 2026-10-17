@@ -1,0 +1,67 @@
+# Put this file in your repo at .github/workflows/build-from-catbox.yml
+# Then: Actions tab -> "Build tweak from zip" -> Run workflow -> paste your catbox link.
+name: Build tweak from zip
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "Direct link to the source zip, e.g. https://files.catbox.moe/xxxxxx.zip"
+        required: true
+        type: string
+      upload_to_catbox:
+        description: "Also upload the built .deb to catbox and print the link"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Install tools
+        run: |
+          brew install ldid dpkg make
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Theos (roothide fork) + SDKs
+        run: |
+          git clone --recursive https://github.com/roothide/theos.git "$HOME/theos"
+          rm -rf "$HOME/theos/sdks"
+          git clone --depth=1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Download source zip
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: |
+          case "$ZIP_URL" in https://*) ;; *) echo "Link must start with https://"; exit 1;; esac
+          curl -fL --retry 3 -o source.zip "$ZIP_URL"
+          mkdir src
+          unzip -q source.zip -d src
+          echo "Zip contents:"; ls -la src
+
+      - name: Build .deb
+        run: |
+          MK=$(find src -name Makefile -not -path '*/__MACOSX/*' | head -n1)
+          if [ -z "$MK" ]; then echo "No Makefile found in the zip"; exit 1; fi
+          cd "$(dirname "$MK")"
+          make package FINALPACKAGE=1
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp packages/*.deb "$GITHUB_WORKSPACE/out/"
+          ls -la "$GITHUB_WORKSPACE/out"
+
+      - name: Upload .deb as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: built-deb
+          path: out/*.deb
+
+      - name: Upload .deb to catbox
+        if: ${{ inputs.upload_to_catbox }}
+        run: |
+          DEB=$(ls out/*.deb | head -n1)
+          URL=$(curl -fsS -F "reqtype=fileupload" -F "fileToUpload=@$DEB" https://catbox.moe/user/api.php)
+          echo "catbox link: $URL"
+          echo "### Built .deb" >> "$GITHUB_STEP_SUMMARY"
+          echo "$URL" >> "$GITHUB_STEP_SUMMARY"
